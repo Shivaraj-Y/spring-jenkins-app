@@ -1,66 +1,76 @@
 pipeline {
-    agent any
-    tools {
-        maven 'maven'
+  agent any
+
+  environment {
+    APP_PORT = "8081"
+    JAR_NAME = "app.jar" // change to actual jar name after build if needed
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
     }
 
-    environment {
-        IMAGE_NAME = 'spring-app'
-        CONTAINER_NAME = 'spring-app-container'
-        APP_PORT = '8083'
-    }
-
-    stages {
-        stage('Build JAR') {
-            steps {
-                sh 'mvn clean package -DskipTests'
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                sh "docker build -t ${IMAGE_NAME} ."
-            }
-        }
-
-        stage('Run Docker Container If Not Running') {
-            steps {
-                script {
-                    def isRunning = sh(script: "docker ps -q -f name=${CONTAINER_NAME}", returnStdout: true).trim()
-
-                    if (isRunning) {
-                        echo "🚫 Container '${CONTAINER_NAME}' is already running. Skipping run."
-                    } else {
-                        def exists = sh(script: "docker ps -a -q -f name=${CONTAINER_NAME}", returnStdout: true).trim()
-                        if (exists) {
-                            echo "🔁 Container exists but not running. Removing it..."
-                            sh "docker rm ${CONTAINER_NAME}"
-                        }
-
-                        echo "🚀 Starting new Docker container..."
-                        sh "docker run -d --name ${CONTAINER_NAME} -p ${APP_PORT}:8080 ${IMAGE_NAME}"
-                    }
-                }
-            }
-        }
-
-        stage('Show Container Status') {
-            steps {
-                echo "📦 Current Docker containers:"
-                sh "docker ps -a --filter name=${CONTAINER_NAME}"
-            }
-        }
-    }
-
-    post {
+    stage('Build') {
+      steps {
+        // if repository uses maven wrapper
+        sh '''
+          if [ -f ./mvnw ]; then
+            ./mvnw -B clean package -DskipTests
+          else
+            mvn -B clean package -DskipTests
+          fi
+        '''
+      }
+      post {
         success {
-            echo "✅ Spring Boot container is handled successfully."
+          archiveArtifacts artifacts: '**/target/*.jar', fingerprint: true
         }
-        failure {
-            echo "❌ Something went wrong with the deployment."
-        }
-        always {
-            echo "ℹ️ Pipeline finished. Check logs above for final status."
-        }
+      }
     }
+
+    stage('Deploy') {
+      steps {
+        // deploy on the same machine where Jenkins runs (app server)
+        sh '''
+          # find jar produced in target/
+          JAR=$(ls */target/*.jar | head -n 1 || true)
+          if [ -z "$JAR" ]; then
+            echo "Jar not found!"
+            exit 1
+          fi
+
+          # copy jar to /opt/myapp/
+          sudo mkdir -p /opt/myapp
+          sudo cp "$JAR" /opt/myapp/${JAR_NAME}
+          sudo chown -R $(whoami):$(whoami) /opt/myapp
+
+          # kill anything on APP_PORT
+          PID=$(lsof -ti tcp:${APP_PORT} || true)
+          if [ -n "$PID" ]; then
+            echo "Killing old process on port ${APP_PORT}: $PID"
+            sudo kill -9 $PID || true
+          fi
+
+          # start jar in background with nohup
+          nohup java -jar /opt/myapp/${JAR_NAME} --server.port=${APP_PORT} > /opt/myapp/app.log 2>&1 &
+          echo $! > /opt/myapp/app.pid
+          sleep 5
+          echo "Started app (PID=$(cat /opt/myapp/app.pid))"
+          tail -n 50 /opt/myapp/app.log || true
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo "Build or deploy failed"
+    }
+    success {
+      echo "Pipeline completed successfully"
+    }
+  }
 }
